@@ -49,15 +49,34 @@ fn main() -> io::Result<()> {
                     &buf[4 + ip_header.slice().len()..nbytes],
                 ) {
                     Ok(tcp_header) => {
+                        use std::collections::hash_map::Entry;
                         let data_start = 4 + ip_header.slice().len() + tcp_header.slice().len();
 
-                        connections
-                            .entry(Quad {
-                                src: (src, tcp_header.source_port()),
-                                dst: (dst, tcp_header.destination_port()),
-                            })
-                            .or_default()
-                            .on_packet(&mut dev, ip_header, tcp_header, &buf[data_start..nbytes]);
+                        match connections.entry(Quad {
+                            src: (src, tcp_header.source_port()),
+                            dst: (dst, tcp_header.destination_port()),
+                        }) {
+                            Entry::Occupied(mut connection) => {
+                                connection.get_mut().on_packet(
+                                    &mut dev,
+                                    ip_header,
+                                    tcp_header,
+                                    &buf[data_start..nbytes],
+                                )?;
+                            }
+                            Entry::Vacant(e) => {
+                                if let Some(connection) = tcp::Connection::accept(
+                                    &mut dev,
+                                    ip_header,
+                                    tcp_header,
+                                    &buf[data_start..nbytes],
+                                )? {
+                                    e.insert(connection);
+                                }
+                            }
+                        }
+
+                        // .or_default()
                     }
                     Err(e) => {
                         eprintln!("Ignoring malformed TCP packet: {:?}", e)

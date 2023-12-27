@@ -28,19 +28,19 @@ pub struct Connection {
 /// ```
 struct SendSequenceSpace {
     /// send unacknowledged
-    una: usize,
+    una: u32,
     /// send next
-    nxt: usize,
+    nxt: u32,
     /// send window
-    wnd: usize,
+    wnd: u16,
     /// send urgent pointer
     up: bool,
     /// segment sequence number used for last window update
-    wl1: usize,
+    wl1: u32,
     /// segment acknowledgment number used for last window update
-    wl2: usize,
+    wl2: u32,
     /// initial send sequence number
-    iss: usize,
+    iss: u32,
 }
 
 /// Receive Sequence Space (RFC 793 S3.2 F5)
@@ -57,90 +57,97 @@ struct SendSequenceSpace {
 /// ```
 struct ReceiveSequenceSpace {
     /// receive next
-    nxt: usize,
+    nxt: u32,
     /// receive window
-    wnd: usize,
+    wnd: u16,
     /// receive urgent pointer
     up: bool,
     /// initial receive sequence number
-    irs: usize,
-}
-
-impl Default for Connection {
-    fn default() -> Self {
-        // State::Closed,
-        Self {
-            state: State::Listen,
-        }
-    }
+    irs: u32,
 }
 
 impl Connection {
-    pub fn on_packet(
-        &self,
+    pub fn accept(
         nic: &mut dyn tun::Device<Queue = tun::platform::Queue>,
         ip_header: etherparse::Ipv4HeaderSlice,
         tcp_header: etherparse::TcpHeaderSlice,
         data: &[u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<Self>> {
         let mut buf = [0u8; 1500];
-
-        match self.state {
-            State::Closed => return Ok(()),
-            State::Listen => {
-                if !tcp_header.syn() {
-                    // only expect SYN packet
-                    return Ok(());
-                }
-
-                // send SYN-ACK
-                let mut syn_ack = etherparse::TcpHeader::new(
-                    tcp_header.destination_port(),
-                    tcp_header.source_port(),
-                    0,
-                    0,
-                );
-                syn_ack.syn = true;
-                syn_ack.ack = true;
-
-                let ip = etherparse::Ipv4Header::new(
-                    syn_ack.header_len(),
-                    64,
-                    etherparse::IpNumber::Tcp as u8,
-                    [
-                        ip_header.destination()[0],
-                        ip_header.destination()[1],
-                        ip_header.destination()[2],
-                        ip_header.destination()[3],
-                    ],
-                    [
-                        ip_header.source()[0],
-                        ip_header.source()[1],
-                        ip_header.source()[2],
-                        ip_header.source()[3],
-                    ],
-                );
-
-                // write headers
-                let unwritten = {
-                    let mut unwritten = &mut buf[..];
-                    ip.write(&mut unwritten);
-                    syn_ack.write(&mut unwritten);
-                    unwritten.len()
-                };
-                nic.write(&buf[..unwritten]).unwrap();
-            }
-            _ => return Ok(()),
+        if !tcp_header.syn() {
+            // only expect SYN packet
+            return Ok(None);
         }
-        eprintln!(
-            "{}:{} -> {}:{} (payload: {} bytes)",
-            ip_header.source_addr(),
-            tcp_header.source_port(),
-            ip_header.destination_addr(),
+
+        let iss = 0;
+        let mut c = Self {
+            state: State::SynRcvd,
+            send: SendSequenceSpace {
+                iss: iss,
+                una: iss,
+                nxt: iss + 1,
+                wnd: 10,
+                up: false,
+                wl1: 0,
+                wl2: 0,
+            },
+            recv: ReceiveSequenceSpace {
+                irs: tcp_header.sequence_number(),
+                nxt: tcp_header.sequence_number() + 1,
+                wnd: tcp_header.window_size(),
+                up: false,
+            },
+        };
+
+        // send SYN-ACK
+        let mut syn_ack = etherparse::TcpHeader::new(
             tcp_header.destination_port(),
-            data.len()
+            tcp_header.source_port(),
+            c.send.iss,
+            c.send.wnd,
+        );
+        syn_ack.acknowledgment_number = c.recv.nxt;
+        syn_ack.syn = true;
+        syn_ack.ack = true;
+
+        let ip = etherparse::Ipv4Header::new(
+            syn_ack.header_len(),
+            64,
+            etherparse::IpNumber::Tcp as u8,
+            [
+                ip_header.destination()[0],
+                ip_header.destination()[1],
+                ip_header.destination()[2],
+                ip_header.destination()[3],
+            ],
+            [
+                ip_header.source()[0],
+                ip_header.source()[1],
+                ip_header.source()[2],
+                ip_header.source()[3],
+            ],
         );
 
-        Ok(())
+        // write headers
+        let unwritten = {
+            let mut unwritten = &mut buf[..];
+            ip.write(&mut unwritten);
+            syn_ack.write(&mut unwritten);
+            unwritten.len()
+        };
+        nic.write(&buf[..unwritten]).unwrap();
+
+        eprintln!("responding with {:02x?}", &buf[..unwritten]);
+
+        Ok(Some(c))
+    }
+    pub fn on_packet(
+        &mut self,
+        nic: &mut dyn tun::Device<Queue = tun::platform::Queue>,
+        ip_header: etherparse::Ipv4HeaderSlice,
+        tcp_header: etherparse::TcpHeaderSlice,
+        data: &[u8],
+    ) -> io::Result<usize> {
+        unimplemented!();
     }
 }
