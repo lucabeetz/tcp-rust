@@ -128,6 +128,10 @@ impl Connection {
             ],
         );
 
+        syn_ack.checksum = syn_ack
+            .calc_checksum_ipv4(&ip, &[])
+            .expect("failed to calculate checksum");
+
         // write headers
         let unwritten = {
             let mut unwritten = &mut buf[..];
@@ -135,9 +139,12 @@ impl Connection {
             syn_ack.write(&mut unwritten);
             unwritten.len()
         };
-        nic.write(&buf[..unwritten]).unwrap();
+        // send flags and proto first (again 0x2 because of macos)
+        let mut new_buf = vec![0, 0, 0, 2];
+        new_buf.extend_from_slice(&buf[..buf.len() - unwritten]);
+        nic.write(&new_buf).unwrap();
 
-        eprintln!("responding with {:02x?}", &buf[..unwritten]);
+        eprintln!("responding with {:02x?}", &buf[..buf.len() - unwritten]);
 
         Ok(Some(c))
     }
@@ -148,6 +155,6 @@ impl Connection {
         tcp_header: etherparse::TcpHeaderSlice,
         data: &[u8],
     ) -> io::Result<usize> {
-        unimplemented!();
+        Ok(0)
     }
 }
