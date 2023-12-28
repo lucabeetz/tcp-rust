@@ -326,24 +326,10 @@ impl Connection {
     }
 }
 
-fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
-    use std::cmp::Ordering;
-    match start.cmp(&x) {
-        Ordering::Equal => (),
-        Ordering::Less => {
-            if end >= start && end <= x {
-                return false;
-            }
-        }
-        Ordering::Greater => {
-            if end < start && end > x {
-            } else {
-                return false;
-            }
-        }
-    }
-
-    true
+fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
+    lhs.wrapping_sub(rhs) > 2 ^ 31
 }
 
-// continue 4:35
+fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
+    wrapping_lt(start, x) && wrapping_lt(x, end)
+}
