@@ -96,13 +96,14 @@ impl Connection {
         }
 
         let iss = 0;
+        let wnd = 1024;
         let mut c = Self {
             state: State::SynRcvd,
             send: SendSequenceSpace {
                 iss: iss,
                 una: iss,
-                nxt: iss + 1,
-                wnd: 10,
+                nxt: iss,
+                wnd: wnd,
                 up: false,
                 wl1: 0,
                 wl2: 0,
@@ -158,7 +159,12 @@ impl Connection {
             self.tcp.header_len() as usize + self.ip.header_len() as usize + payload.len(),
         );
         self.ip
-            .set_payload_len(self.tcp.header_len() as usize + payload.len());
+            .set_payload_len(size - self.ip.header_len() as usize);
+
+        self.tcp.checksum = self
+            .tcp
+            .calc_checksum_ipv4(&self.ip, &[])
+            .expect("failed to checksum");
 
         let mut unwritten = &mut buf[..];
         self.ip.write(&mut unwritten);
@@ -214,19 +220,22 @@ impl Connection {
             slen += 1;
         }
         let wend = self.recv.nxt.wrapping_add(self.recv.wnd as u32);
-
-        if slen == 0 {
+        let okay = if slen == 0 {
             // zero length segment
             if self.recv.wnd == 0 {
                 if seqn != self.recv.nxt {
-                    return Ok(());
+                    false
+                } else {
+                    true
                 }
             } else if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend) {
-                return Ok(());
+                false
+            } else {
+                true
             }
         } else {
             if self.recv.wnd == 0 {
-                return Ok(());
+                false
             } else if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend)
                 && !is_between_wrapped(
                     self.recv.nxt.wrapping_sub(1),
@@ -234,19 +243,26 @@ impl Connection {
                     wend,
                 )
             {
-                return Ok(());
+                false
+            } else {
+                true
             }
-        }
+        };
 
-        if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend)
-            && !is_between_wrapped(
-                self.recv.nxt.wrapping_sub(1),
-                seqn + data.len() as u32 - 1,
-                wend,
-            )
-        {
+        if !okay {
+            self.write(nic, &[])?;
             return Ok(());
         }
+
+        // if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend)
+        //     && !is_between_wrapped(
+        //         self.recv.nxt.wrapping_sub(1),
+        //         seqn + data.len() as u32 - 1,
+        //         wend,
+        //     )
+        // {
+        //     return Ok(());
+        // }
         self.recv.nxt = seqn.wrapping_add(slen);
         // TODO: if not acceptable, send ACK
 
@@ -256,7 +272,7 @@ impl Connection {
 
         let ackn = tcp_header.acknowledgment_number();
         if let State::SynRcvd = self.state {
-            if !is_between_wrapped(
+            if is_between_wrapped(
                 self.send.una.wrapping_sub(1),
                 ackn,
                 self.send.nxt.wrapping_add(1),
@@ -272,7 +288,7 @@ impl Connection {
         // self.write(nic, &[])?;
         // self.state = State::FinWait1;
 
-        if let State::Estab = self.state {
+        if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
             if !is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
                 return Ok(());
             }
@@ -280,11 +296,13 @@ impl Connection {
             // TODO
             assert!(data.is_empty());
 
-            // terminate the connection
-            // TODO: don't save it on the header, should only be set for last packet
-            self.tcp.fin = true;
-            self.write(nic, &[])?;
-            self.state = State::FinWait1;
+            if let State::Estab = self.state {
+                // terminate the connection
+                // TODO: don't save it on the header, should only be set for last packet
+                self.tcp.fin = true;
+                self.write(nic, &[])?;
+                self.state = State::FinWait1;
+            }
         }
 
         if let State::FinWait1 = self.state {
