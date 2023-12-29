@@ -1,19 +1,9 @@
-use std::collections::HashMap;
 use std::io;
 use std::io::Read;
-use std::net::Ipv4Addr;
 
 mod tcp;
 
-#[derive(Clone, Copy, Hash, Eq, PartialEq, Debug)]
-struct Quad {
-    src: (Ipv4Addr, u16),
-    dst: (Ipv4Addr, u16),
-}
-
 fn main() -> io::Result<()> {
-    let mut connections: HashMap<Quad, tcp::Connection> = Default::default();
-
     let mut config = tun::Configuration::default();
     config
         .address((10, 0, 0, 1))
