@@ -1,5 +1,14 @@
+use bitflags::bitflags;
+use std::collections::VecDeque;
 use std::io;
 use std::io::Write;
+
+bitflags! {
+    pub(crate) struct Available: u8 {
+        const READ = 0b00000001;
+        const WRITE = 0b00000010;
+    }
+}
 
 pub enum State {
     SynRcvd,
@@ -27,6 +36,28 @@ pub struct Connection {
     recv: ReceiveSequenceSpace,
     ip: etherparse::Ipv4Header,
     tcp: etherparse::TcpHeader,
+
+    pub(crate) incoming: VecDeque<u8>,
+    pub(crate) unacked: VecDeque<u8>,
+}
+
+impl Connection {
+    pub(crate) fn is_rcv_closed(&self) -> bool {
+        if let State::TimeWait = self.state {
+            true
+        } else {
+            false
+        }
+    }
+
+    fn availability(&self) -> Available {
+        let mut a = Available::empty();
+        if self.is_rcv_closed() || !self.incoming.is_empty() {
+            a |= Available::READ;
+        }
+        // TODO: set available WRITE
+        a
+    }
 }
 
 /// Send Sequence Space (RFC 793 S3.2 F4)
@@ -137,6 +168,8 @@ impl Connection {
                 iss,
                 10,
             ),
+            incoming: VecDeque::new(),
+            unacked: VecDeque::new(),
         };
 
         c.tcp.syn = true;
@@ -208,7 +241,7 @@ impl Connection {
         ip_header: etherparse::Ipv4HeaderSlice,
         tcp_header: etherparse::TcpHeaderSlice,
         data: &[u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<Available> {
         // valid segment check
         // RCV.NXT <= SEG.SEQ < RCV.NXT + RCV.WND
         let seqn = tcp_header.sequence_number();
@@ -251,7 +284,7 @@ impl Connection {
 
         if !okay {
             self.write(nic, &[])?;
-            return Ok(());
+            return Ok(self.availability());
         }
 
         // if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend)
@@ -267,7 +300,7 @@ impl Connection {
         // TODO: if not acceptable, send ACK
 
         if !tcp_header.ack() {
-            return Ok(());
+            return Ok(self.availability());
         }
 
         let ackn = tcp_header.acknowledgment_number();
@@ -289,10 +322,9 @@ impl Connection {
         // self.state = State::FinWait1;
 
         if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
-            if !is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
-                return Ok(());
+            if is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
+                self.send.una = ackn;
             }
-            self.send.una = ackn;
             // TODO
             assert!(data.is_empty());
 
@@ -322,7 +354,7 @@ impl Connection {
             }
         }
 
-        Ok(())
+        Ok(self.availability())
     }
 }
 
