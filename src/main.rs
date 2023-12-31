@@ -4,14 +4,22 @@ use std::{io, thread};
 fn main() -> io::Result<()> {
     let mut i = tcprust::Interface::new()?;
     eprintln!("Created interface");
-    let mut l1 = i.bind(9000)?;
-    let jh1 = thread::spawn(move || {
-        while let Ok(mut stream) = l1.accept() {
+    let mut l = i.bind(9000)?;
+    let jh = thread::spawn(move || {
+        while let Ok(mut stream) = l.accept() {
             eprintln!("got connection");
-            let n = stream.read(&mut [0]).unwrap();
-            eprintln!("read {} bytes", n);
+            loop {
+                let mut buf = [0; 512];
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    eprintln!("no more data");
+                    break;
+                } else {
+                    eprintln!("got {:?}", buf);
+                }
+            }
         }
     });
-    jh1.join().unwrap();
+    jh.join().unwrap();
     Ok(())
 }

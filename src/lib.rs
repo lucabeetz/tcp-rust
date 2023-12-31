@@ -92,7 +92,7 @@ fn packet_loop(mut dev: tun::platform::Device, ih: InterfaceHandle) -> io::Resul
                                     &buf[data_start..nbytes],
                                 )?;
 
-                                drop(cm);
+                                drop(cmg);
                                 if a.contains(tcp::Available::READ) {
                                     ih.rcv_var.notify_all();
                                 }
@@ -178,39 +178,40 @@ pub struct TcpStream(Quad, InterfaceHandle);
 impl Drop for TcpStream {
     fn drop(&mut self) {
         let mut cm = self.1.manager.lock().unwrap();
-        if let Some(c) = cm.connections.remove(&self.0) {
-            // TODO: Send FIN
-            unimplemented!()
-        }
+        // if let Some(c) = cm.connections.remove(&self.0) {
+        //     // TODO: Send FIN
+        //     unimplemented!()
+        // }
     }
 }
 
 impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut cm = self.1.manager.lock().unwrap();
-        let c = cm.connections.get_mut(&self.0).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::ConnectionAborted, "connection not found")
-        })?;
+        loop {
+            let c = cm.connections.get_mut(&self.0).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::ConnectionAborted, "connection not found")
+            })?;
 
-        if c.is_rcv_closed() && c.incoming.is_empty() {
-            // no more data to read and connection is closed, no need to block
-            return Ok(0);
-        }
-        if !c.incoming.is_empty() {
-            let mut nread = 0;
-            let (head, tail) = c.incoming.as_slices();
-            let hread = std::cmp::min(buf.len(), head.len());
-            buf.copy_from_slice(&head[..hread]);
-            nread += hread;
-            let tread = std::cmp::min(buf.len() - nread, tail.len());
-            buf.copy_from_slice(&tail[..tread]);
-            nread += tread;
-            drop(c.incoming.drain(..nread));
-            return Ok(nread);
-        }
+            if c.is_rcv_closed() && c.incoming.is_empty() {
+                // no more data to read and connection is closed, no need to block
+                return Ok(0);
+            }
+            if !c.incoming.is_empty() {
+                let mut nread = 0;
+                let (head, tail) = c.incoming.as_slices();
+                let hread = std::cmp::min(buf.len(), head.len());
+                buf[..hread].copy_from_slice(&head[..hread]);
+                nread += hread;
+                let tread = std::cmp::min(buf.len() - nread, tail.len());
+                buf[hread..(hread + tread)].copy_from_slice(&tail[..tread]);
+                nread += tread;
+                drop(c.incoming.drain(..nread));
+                return Ok(nread);
+            }
 
-        cm = self.1.rcv_var.wait(cm).unwrap();
-        Ok(0)
+            cm = self.1.rcv_var.wait(cm).unwrap();
+        }
     }
 }
 
@@ -271,14 +272,12 @@ impl Drop for TcpListener {
 impl TcpListener {
     pub fn accept(&mut self) -> io::Result<TcpStream> {
         let mut cm = self.1.manager.lock().unwrap();
-        if let Some(quad) = cm.pending.get_mut(&self.0).unwrap().pop_front() {
-            return Ok(TcpStream(quad, self.1.clone()));
-        } else {
-            // TODO: block
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "no pending connections",
-            ));
+        loop {
+            if let Some(quad) = cm.pending.get_mut(&self.0).unwrap().pop_front() {
+                return Ok(TcpStream(quad, self.1.clone()));
+            }
+
+            cm = self.1.pending_var.wait(cm).unwrap();
         }
     }
 }

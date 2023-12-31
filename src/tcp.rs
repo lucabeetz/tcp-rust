@@ -296,10 +296,12 @@ impl Connection {
         // {
         //     return Ok(());
         // }
-        self.recv.nxt = seqn.wrapping_add(slen);
         // TODO: if not acceptable, send ACK
 
         if !tcp_header.ack() {
+            if tcp_header.syn() {
+                self.recv.nxt = seqn.wrapping_add(1);
+            }
             return Ok(self.availability());
         }
 
@@ -325,14 +327,15 @@ impl Connection {
             if is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
                 self.send.una = ackn;
             }
-            // TODO
-            assert!(data.is_empty());
+
+            // TODO: only read what we haven't read yet
+            // TODO: wake up awaiting readers
 
             if let State::Estab = self.state {
                 // terminate the connection
                 // TODO: don't save it on the header, should only be set for last packet
                 self.tcp.fin = true;
-                self.write(nic, &[])?;
+                // self.write(nic, &[])?;
                 self.state = State::FinWait1;
             }
         }
@@ -341,6 +344,23 @@ impl Connection {
             if self.send.una == self.send.iss + 2 {
                 self.state = State::FinWait2;
             }
+        }
+
+        if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+            let mut unread_data_at = (self.recv.nxt - seqn) as usize;
+            if unread_data_at > data.len() {
+                // must have received retransmitted FIN
+                unread_data_at = 0;
+            }
+
+            // only read what we haven't read yet
+            self.incoming.extend(&data[unread_data_at..]);
+
+            self.recv.nxt = seqn
+                .wrapping_add(data.len() as u32)
+                .wrapping_add(if tcp_header.fin() { 1 } else { 0 });
+
+            self.write(nic, &[])?;
         }
 
         if tcp_header.fin() {
