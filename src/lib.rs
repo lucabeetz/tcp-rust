@@ -62,7 +62,7 @@ fn packet_loop(mut dev: tun::platform::Device, ih: InterfaceHandle) -> io::Resul
             &dev_file,
             nix::poll::PollFlags::POLLIN,
         )];
-        let n = nix::poll::poll(&mut pfd, 1)?;
+        let n = nix::poll::poll(&mut pfd[..], 10)?;
         assert_ne!(n, -1);
         if n == 0 {
             // TODO: timed out

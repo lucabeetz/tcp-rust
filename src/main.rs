@@ -2,12 +2,14 @@ use std::io::prelude::*;
 use std::{io, thread};
 
 fn main() -> io::Result<()> {
-    let mut i = tcprust::Interface::new()?;
+    let mut interface = tcprust::Interface::new()?;
     eprintln!("Created interface");
-    let mut l = i.bind(9000)?;
-    let jh = thread::spawn(move || {
-        while let Ok(mut stream) = l.accept() {
-            eprintln!("got connection");
+    let mut listener = interface.bind(9001)?;
+
+    while let Ok(mut stream) = listener.accept() {
+        thread::spawn(move || {
+            stream.write(b"Hello World").unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
             loop {
                 let mut buf = [0; 512];
                 let n = stream.read(&mut buf).unwrap();
@@ -15,11 +17,11 @@ fn main() -> io::Result<()> {
                     eprintln!("no more data");
                     break;
                 } else {
-                    eprintln!("got {:?}", buf);
+                    println!("{}", std::str::from_utf8(&buf[..n]).unwrap());
                 }
             }
-        }
-    });
-    jh.join().unwrap();
+        });
+    }
+
     Ok(())
 }

@@ -236,14 +236,14 @@ impl Connection {
         self.ip
             .set_payload_len(size - self.ip.header_len() as usize);
 
-        self.tcp.checksum = self
-            .tcp
-            .calc_checksum_ipv4(&self.ip, &[])
-            .expect("failed to checksum");
-
+        let buf_len = buf.len();
         let mut unwritten = &mut buf[..];
+
         self.ip.write(&mut unwritten);
-        self.tcp.write(&mut unwritten)?;
+        let ip_header_ends_at = buf_len - unwritten.len();
+
+        unwritten = &mut unwritten[self.tcp.header_len() as usize..];
+        let tcp_header_ends_at = buf_len - unwritten.len();
 
         let payload_bytes = {
             let mut written = 0;
@@ -257,14 +257,17 @@ impl Connection {
             written += unwritten.write(&t[..pl2])?;
             written
         };
+        let payload_ends_at = buf_len - unwritten.len();
 
-        let unwritten = unwritten.len();
+        self.tcp.checksum = self
+            .tcp
+            .calc_checksum_ipv4(&self.ip, &buf[tcp_header_ends_at..payload_ends_at])
+            .expect("failed to checksum");
+
+        let mut tcp_header_buf = &mut buf[ip_header_ends_at..payload_ends_at];
+        self.tcp.write(&mut tcp_header_buf)?;
+
         let mut next_seq = seq.wrapping_add(payload_bytes as u32);
-
-        // write packet flags and protocol first
-        let mut new_buf = vec![0, 0, 0, 2];
-        new_buf.extend_from_slice(&buf[..buf.len() - unwritten]);
-
         if self.tcp.syn {
             next_seq = next_seq.wrapping_add(1);
             self.tcp.syn = false;
@@ -279,7 +282,11 @@ impl Connection {
         }
         self.timers.send_times.insert(seq, time::Instant::now());
 
-        nic.write(&new_buf).unwrap();
+        // write packet flags and protocol first
+        let mut new_buf = vec![0, 0, 0, 2];
+        new_buf.extend_from_slice(&buf[..payload_ends_at]);
+
+        nic.write(&new_buf)?;
         Ok(payload_bytes)
     }
 
@@ -397,8 +404,10 @@ impl Connection {
         }
 
         if let State::FinWait1 = self.state {
-            if self.send.una == self.send.iss + 2 {
-                self.state = State::FinWait2;
+            if let Some(closed_at) = self.closed_at {
+                if self.send.una == closed_at.wrapping_add(1) {
+                    self.state = State::FinWait2;
+                }
             }
         }
 
@@ -427,7 +436,9 @@ impl Connection {
                     self.write(nic, self.send.nxt, 0)?;
                     self.state = State::TimeWait;
                 }
-                _ => unimplemented!(),
+                _ => {
+                    // unimplemented!(),
+                }
             }
         }
 
@@ -438,11 +449,15 @@ impl Connection {
         &mut self,
         dev: &mut dyn tun::Device<Queue = tun::platform::Queue>,
     ) -> io::Result<()> {
-        let nunacked = self
+        if let State::FinWait2 | State::TimeWait = self.state {
+            return Ok(());
+        }
+
+        let nunacked_data = self
             .closed_at
             .unwrap_or(self.send.nxt)
             .wrapping_sub(self.send.una);
-        let nunsent = self.unacked.len() as u32 - nunacked;
+        let nunsent_data = self.unacked.len() as u32 - nunacked_data;
 
         let waited_for = self
             .timers
@@ -466,24 +481,22 @@ impl Connection {
                 self.tcp.fin = true;
                 self.closed_at = Some(self.send.una.wrapping_add(self.unacked.len() as u32));
             }
-            let (h, t) = self.unacked.as_slices();
             self.write(dev, self.send.una, resend as usize)?;
-            self.send.nxt = self.send.una.wrapping_add(resend);
         } else {
             // send new data if new data available and space in window
-            if nunsent == 0 && self.closed_at.is_some() {
+            if nunsent_data == 0 && self.closed_at.is_some() {
                 return Ok(());
             }
 
-            let allowed = self.send.wnd as u32 - nunacked;
+            let allowed = self.send.wnd as u32 - nunacked_data;
             if allowed == 0 {
                 return Ok(());
             }
 
-            let send = std::cmp::min(nunsent, allowed);
+            let send = std::cmp::min(nunsent_data, allowed);
             if send < allowed && self.closed && self.closed_at.is_none() {
                 self.tcp.fin = true;
-                self.closed_at = Some(self.send.nxt.wrapping_add(nunsent as u32));
+                self.closed_at = Some(self.send.una.wrapping_add(self.unacked.len() as u32));
             }
 
             self.write(dev, self.send.nxt, send as usize)?;
