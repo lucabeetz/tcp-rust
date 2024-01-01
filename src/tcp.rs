@@ -204,7 +204,7 @@ impl Connection {
         &mut self,
         nic: &mut dyn tun::Device<Queue = tun::platform::Queue>,
         seq: u32,
-        limit: usize,
+        mut limit: usize,
     ) -> io::Result<usize> {
         let mut buf = [0u8; 1500];
         self.tcp.sequence_number = seq;
@@ -280,7 +280,7 @@ impl Connection {
         self.timers.send_times.insert(seq, time::Instant::now());
 
         nic.write(&new_buf).unwrap();
-        Ok(payload.len())
+        Ok(payload_bytes)
     }
 
     fn send_rst(
@@ -346,17 +346,6 @@ impl Connection {
             return Ok(self.availability());
         }
 
-        // if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend)
-        //     && !is_between_wrapped(
-        //         self.recv.nxt.wrapping_sub(1),
-        //         seqn + data.len() as u32 - 1,
-        //         wend,
-        //     )
-        // {
-        //     return Ok(());
-        // }
-        // TODO: if not acceptable, send ACK
-
         if !tcp_header.ack() {
             if tcp_header.syn() {
                 self.recv.nxt = seqn.wrapping_add(1);
@@ -376,27 +365,30 @@ impl Connection {
                 // TODO: reset
             }
         }
-        // terminate the connection
-        // TODO: don't save it on the header, should only be set for last packet
-        // self.tcp.fin = true;
-        // self.write(nic, &[])?;
-        // self.state = State::FinWait1;
 
         if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
             if is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
-                let nacked = self
-                    .unacked
-                    .drain(..ackn.wrapping_sub(self.send.una) as usize)
-                    .count();
-                self.timers.send_times.retain(|&seq, sent| {
-                    if is_between_wrapped(self.send.una, seq, ackn) {
-                        let rtt = sent.elapsed();
-                        self.timers.srtt = 0.8 * self.timers.srtt + (1.0 - 0.8) * rtt.as_secs_f64();
-                        false
+                if !self.unacked.is_empty() {
+                    let data_start = if self.send.una == self.send.iss {
+                        self.send.una.wrapping_add(1)
                     } else {
-                        true
-                    }
-                });
+                        self.send.una
+                    };
+                    let acked_data_end =
+                        std::cmp::min(ackn.wrapping_sub(data_start) as usize, self.unacked.len());
+                    self.unacked.drain(..acked_data_end);
+
+                    self.timers.send_times.retain(|&seq, sent| {
+                        if is_between_wrapped(self.send.una, seq, ackn) {
+                            let rtt = sent.elapsed();
+                            self.timers.srtt =
+                                0.8 * self.timers.srtt + (1.0 - 0.8) * rtt.as_secs_f64();
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
                 self.send.una = ackn;
             }
 
@@ -410,27 +402,28 @@ impl Connection {
             }
         }
 
-        if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
-            let mut unread_data_at = (self.recv.nxt - seqn) as usize;
-            if unread_data_at > data.len() {
-                // must have received retransmitted FIN
-                unread_data_at = 0;
+        if !data.is_empty() {
+            if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+                let mut unread_data_at = self.recv.nxt.wrapping_sub(seqn) as usize;
+                if unread_data_at > data.len() {
+                    // must have received retransmitted FIN
+                    unread_data_at = 0;
+                }
+
+                // only read what we haven't read yet
+                self.incoming.extend(&data[unread_data_at..]);
+
+                self.recv.nxt = seqn.wrapping_add(data.len() as u32);
+
+                self.write(nic, self.send.nxt, 0)?;
             }
-
-            // only read what we haven't read yet
-            self.incoming.extend(&data[unread_data_at..]);
-
-            self.recv.nxt = seqn
-                .wrapping_add(data.len() as u32)
-                .wrapping_add(if tcp_header.fin() { 1 } else { 0 });
-
-            self.write(nic, self.send.nxt, 0)?;
         }
 
         if tcp_header.fin() {
             match self.state {
                 State::FinWait2 => {
                     // done with connection
+                    self.recv.nxt = self.recv.nxt.wrapping_add(1);
                     self.write(nic, self.send.nxt, 0)?;
                     self.state = State::TimeWait;
                 }
@@ -442,11 +435,14 @@ impl Connection {
     }
 
     pub(crate) fn on_tick(
-        &self,
+        &mut self,
         dev: &mut dyn tun::Device<Queue = tun::platform::Queue>,
     ) -> io::Result<()> {
-        let nunacked = self.send.nxt.wrapping_sub(self.send.una);
-        let unsent = self.unacked.len() - nunacked as usize;
+        let nunacked = self
+            .closed_at
+            .unwrap_or(self.send.nxt)
+            .wrapping_sub(self.send.una);
+        let nunsent = self.unacked.len() as u32 - nunacked;
 
         let waited_for = self
             .timers
@@ -475,29 +471,22 @@ impl Connection {
             self.send.nxt = self.send.una.wrapping_add(resend);
         } else {
             // send new data if new data available and space in window
-            if unsent == 0 && self.closed_at.is_some() {
+            if nunsent == 0 && self.closed_at.is_some() {
                 return Ok(());
             }
 
-            let allowed = self.send.wnd - nunacked as u16;
+            let allowed = self.send.wnd as u32 - nunacked;
             if allowed == 0 {
                 return Ok(());
             }
 
-            let send = std::cmp::min(allowed as usize, unsent);
+            let send = std::cmp::min(nunsent, allowed);
             if send < allowed && self.closed && self.closed_at.is_none() {
                 self.tcp.fin = true;
-                self.closed_at = Some(self.send.nxt.wrapping_add(unsent as u32));
+                self.closed_at = Some(self.send.nxt.wrapping_add(nunsent as u32));
             }
-            let (mut h, mut t) = self.unacked.as_slices();
-            if h.len() >= nunacked {
-                h = &h[nunacked..];
-            } else {
-                let skipped = h.len();
-                h = &[];
-                t = &t[(nunacked - skipped)..];
-            }
-            self.write(dev, self.send.nxt, 0, 0)?;
+
+            self.write(dev, self.send.nxt, send as usize)?;
         }
 
         Ok(())

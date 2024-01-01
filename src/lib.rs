@@ -3,7 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::io::prelude::*;
 use std::net::Ipv4Addr;
-use std::os::fd::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -13,6 +13,12 @@ mod tcp;
 const SENDQUEUE_SIZE: usize = 1024;
 
 type InterfaceHandle = Arc<Foobar>;
+
+// impl AsFd for tun::platform::Device {
+//     fn as_fd(&self) -> &std::os::unix::io::RawFd {
+//         &self.as_raw_fd()
+//     }
+// }
 
 #[derive(Default)]
 struct Foobar {
@@ -47,9 +53,13 @@ struct ConnectionManager {
 fn packet_loop(mut dev: tun::platform::Device, ih: InterfaceHandle) -> io::Result<()> {
     let mut buf = [0u8; 1504];
 
+    // TODO: fix
+    eprintln!("creatin dev file");
+    let dev_file = unsafe { std::fs::File::from_raw_fd(dev.as_raw_fd()) };
+
     loop {
         let mut pfd = [nix::poll::PollFd::new(
-            dev.as_raw_fd(),
+            &dev_file,
             nix::poll::PollFlags::POLLIN,
         )];
         let n = nix::poll::poll(&mut pfd, 1)?;
@@ -57,7 +67,7 @@ fn packet_loop(mut dev: tun::platform::Device, ih: InterfaceHandle) -> io::Resul
         if n == 0 {
             // TODO: timed out
             let mut cmg = ih.manager.lock().unwrap();
-            for connection in cmg.connections.values() {
+            for connection in cmg.connections.values_mut() {
                 connection.on_tick(&mut dev)?;
             }
             continue;
@@ -223,6 +233,7 @@ impl Read for TcpStream {
                 // no more data to read and connection is closed, no need to block
                 return Ok(0);
             }
+
             if !c.incoming.is_empty() {
                 let mut nread = 0;
                 let (head, tail) = c.incoming.as_slices();
