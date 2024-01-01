@@ -1,7 +1,9 @@
+use nix;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::io::prelude::*;
 use std::net::Ipv4Addr;
+use std::os::fd::AsRawFd;
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -46,7 +48,22 @@ fn packet_loop(mut dev: tun::platform::Device, ih: InterfaceHandle) -> io::Resul
     let mut buf = [0u8; 1504];
 
     loop {
+        let mut pfd = [nix::poll::PollFd::new(
+            dev.as_raw_fd(),
+            nix::poll::PollFlags::POLLIN,
+        )];
+        let n = nix::poll::poll(&mut pfd, 1)?;
+        assert_ne!(n, -1);
+        if n == 0 {
+            // TODO: timed out
+            let mut cmg = ih.manager.lock().unwrap();
+            for connection in cmg.connections.values() {
+                connection.on_tick(&mut dev)?;
+            }
+            continue;
+        }
         let nbytes = dev.read(&mut buf)?;
+
         let _eth_flags = u16::from_be_bytes([buf[0], buf[1]]);
         let eth_proto = u16::from_be_bytes([buf[2], buf[3]]);
 
@@ -173,6 +190,15 @@ impl Interface {
     }
 }
 
+impl Drop for Interface {
+    fn drop(&mut self) {
+        self.ih.as_mut().unwrap().manager.lock().unwrap().terminate = true;
+        drop(self.ih.take());
+        self.ih = None;
+        self.jh.take().unwrap().join().unwrap().unwrap();
+    }
+}
+
 pub struct TcpStream(Quad, InterfaceHandle);
 
 impl Drop for TcpStream {
@@ -250,6 +276,30 @@ impl Write for TcpStream {
                 "connection buffer full",
             ))
         }
+    }
+}
+
+impl TcpStream {
+    pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        let mut cm = self.1.manager.lock().unwrap();
+        let c = cm.connections.get_mut(&self.0).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::ConnectionAborted, "connection not found")
+        })?;
+
+        c.closed = true;
+        match c.state {
+            tcp::State::SynRcvd | tcp::State::Estab => {
+                c.state = tcp::State::FinWait1;
+            }
+            tcp::State::FinWait1 | tcp::State::FinWait2 => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "connection not established",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

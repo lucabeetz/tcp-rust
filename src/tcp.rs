@@ -1,7 +1,7 @@
 use bitflags::bitflags;
-use std::collections::VecDeque;
-use std::io;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
+use std::{io, time};
 
 bitflags! {
     pub(crate) struct Available: u8 {
@@ -28,17 +28,33 @@ impl State {
             }
         }
     }
+
+    fn have_sent_fin(&self) -> bool {
+        match self {
+            State::SynRcvd | State::Estab => false,
+            State::FinWait1 | State::Closing | State::FinWait2 | State::TimeWait => true,
+        }
+    }
 }
 
 pub struct Connection {
-    state: State,
+    pub(crate) state: State,
     send: SendSequenceSpace,
     recv: ReceiveSequenceSpace,
     ip: etherparse::Ipv4Header,
     tcp: etherparse::TcpHeader,
 
+    timers: Timers,
+
     pub(crate) incoming: VecDeque<u8>,
     pub(crate) unacked: VecDeque<u8>,
+    pub(crate) closed: bool,
+    closed_at: Option<u32>,
+}
+
+struct Timers {
+    send_times: BTreeMap<u32, time::Instant>,
+    srtt: f64,
 }
 
 impl Connection {
@@ -129,6 +145,12 @@ impl Connection {
         let iss = 0;
         let wnd = 1024;
         let mut c = Self {
+            closed: false,
+            closed_at: None,
+            timers: Timers {
+                send_times: Default::default(),
+                srtt: time::Duration::from_secs(60).as_secs_f64(),
+            },
             state: State::SynRcvd,
             send: SendSequenceSpace {
                 iss: iss,
@@ -174,22 +196,42 @@ impl Connection {
 
         c.tcp.syn = true;
         c.tcp.ack = true;
-        c.write(nic, &[])?;
+        c.write(nic, c.send.nxt, 0)?;
         Ok(Some(c))
     }
 
     fn write(
         &mut self,
         nic: &mut dyn tun::Device<Queue = tun::platform::Queue>,
-        payload: &[u8],
+        seq: u32,
+        limit: usize,
     ) -> io::Result<usize> {
         let mut buf = [0u8; 1500];
-        self.tcp.sequence_number = self.send.nxt;
+        self.tcp.sequence_number = seq;
         self.tcp.acknowledgment_number = self.recv.nxt;
 
+        // special case the virtual bytes SYN and FIN
+        let mut offset = seq.wrapping_sub(self.send.una) as usize;
+        if let Some(closed_at) = self.closed_at {
+            if seq == closed_at.wrapping_add(1) {
+                offset = 0;
+                limit = 0;
+            }
+        }
+
+        let (mut h, mut t) = self.unacked.as_slices();
+        if h.len() >= offset {
+            h = &h[offset..];
+        } else {
+            let skipped = h.len();
+            h = &[];
+            t = &t[(offset - skipped)..];
+        }
+
+        let max_data = std::cmp::min(limit, h.len() + t.len());
         let size = std::cmp::min(
             buf.len(),
-            self.tcp.header_len() as usize + self.ip.header_len() as usize + payload.len(),
+            self.tcp.header_len() as usize + self.ip.header_len() as usize + max_data,
         );
         self.ip
             .set_payload_len(size - self.ip.header_len() as usize);
@@ -202,22 +244,40 @@ impl Connection {
         let mut unwritten = &mut buf[..];
         self.ip.write(&mut unwritten);
         self.tcp.write(&mut unwritten)?;
-        let payload_bytes = unwritten.write(payload)?;
+
+        let payload_bytes = {
+            let mut written = 0;
+            let mut limit = max_data;
+
+            let pl1 = std::cmp::min(limit, h.len());
+            written += unwritten.write(&h[..pl1])?;
+            limit -= written;
+
+            let pl2 = std::cmp::min(limit, t.len());
+            written += unwritten.write(&t[..pl2])?;
+            written
+        };
+
         let unwritten = unwritten.len();
+        let mut next_seq = seq.wrapping_add(payload_bytes as u32);
 
         // write packet flags and protocol first
         let mut new_buf = vec![0, 0, 0, 2];
         new_buf.extend_from_slice(&buf[..buf.len() - unwritten]);
 
-        self.send.nxt = self.send.nxt.wrapping_add(payload_bytes as u32);
         if self.tcp.syn {
-            self.send.nxt = self.send.nxt.wrapping_add(1);
+            next_seq = next_seq.wrapping_add(1);
             self.tcp.syn = false;
         }
         if self.tcp.fin {
-            self.send.nxt = self.send.nxt.wrapping_add(1);
+            next_seq = next_seq.wrapping_add(1);
             self.tcp.fin = false;
         }
+
+        if wrapping_lt(self.send.nxt, next_seq) {
+            self.send.nxt = next_seq;
+        }
+        self.timers.send_times.insert(seq, time::Instant::now());
 
         nic.write(&new_buf).unwrap();
         Ok(payload.len())
@@ -230,8 +290,7 @@ impl Connection {
         self.tcp.rst = true;
         self.tcp.sequence_number = 0;
         self.tcp.acknowledgment_number = 0;
-        self.ip.set_payload_len(self.tcp.header_len() as usize);
-        self.write(nic, &[])?;
+        self.write(nic, self.send.nxt, 0)?;
         Ok(())
     }
 
@@ -283,7 +342,7 @@ impl Connection {
         };
 
         if !okay {
-            self.write(nic, &[])?;
+            self.write(nic, self.send.nxt, 0)?;
             return Ok(self.availability());
         }
 
@@ -325,19 +384,24 @@ impl Connection {
 
         if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
             if is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
+                let nacked = self
+                    .unacked
+                    .drain(..ackn.wrapping_sub(self.send.una) as usize)
+                    .count();
+                self.timers.send_times.retain(|&seq, sent| {
+                    if is_between_wrapped(self.send.una, seq, ackn) {
+                        let rtt = sent.elapsed();
+                        self.timers.srtt = 0.8 * self.timers.srtt + (1.0 - 0.8) * rtt.as_secs_f64();
+                        false
+                    } else {
+                        true
+                    }
+                });
                 self.send.una = ackn;
             }
 
             // TODO: only read what we haven't read yet
             // TODO: wake up awaiting readers
-
-            if let State::Estab = self.state {
-                // terminate the connection
-                // TODO: don't save it on the header, should only be set for last packet
-                self.tcp.fin = true;
-                // self.write(nic, &[])?;
-                self.state = State::FinWait1;
-            }
         }
 
         if let State::FinWait1 = self.state {
@@ -360,14 +424,14 @@ impl Connection {
                 .wrapping_add(data.len() as u32)
                 .wrapping_add(if tcp_header.fin() { 1 } else { 0 });
 
-            self.write(nic, &[])?;
+            self.write(nic, self.send.nxt, 0)?;
         }
 
         if tcp_header.fin() {
             match self.state {
                 State::FinWait2 => {
                     // done with connection
-                    self.write(nic, &[])?;
+                    self.write(nic, self.send.nxt, 0)?;
                     self.state = State::TimeWait;
                 }
                 _ => unimplemented!(),
@@ -375,6 +439,72 @@ impl Connection {
         }
 
         Ok(self.availability())
+    }
+
+    pub(crate) fn on_tick(
+        &self,
+        dev: &mut dyn tun::Device<Queue = tun::platform::Queue>,
+    ) -> io::Result<()> {
+        let nunacked = self.send.nxt.wrapping_sub(self.send.una);
+        let unsent = self.unacked.len() - nunacked as usize;
+
+        let waited_for = self
+            .timers
+            .send_times
+            .range(self.send.una..)
+            .next()
+            .map(|(_, t)| t.elapsed());
+
+        let should_retransmit = if let Some(waited_for) = waited_for {
+            waited_for > time::Duration::from_secs(1)
+                && waited_for.as_secs_f64() > 1.5 * self.timers.srtt
+        } else {
+            false
+        };
+
+        if should_retransmit {
+            // should retransmit
+            let resend = std::cmp::min(self.unacked.len() as u32, self.send.wnd as u32);
+            if resend < self.send.wnd as u32 && self.closed {
+                // should we resend FIN
+                self.tcp.fin = true;
+                self.closed_at = Some(self.send.una.wrapping_add(self.unacked.len() as u32));
+            }
+            let (h, t) = self.unacked.as_slices();
+            self.write(dev, self.send.una, resend as usize)?;
+            self.send.nxt = self.send.una.wrapping_add(resend);
+        } else {
+            // send new data if new data available and space in window
+            if unsent == 0 && self.closed_at.is_some() {
+                return Ok(());
+            }
+
+            let allowed = self.send.wnd - nunacked as u16;
+            if allowed == 0 {
+                return Ok(());
+            }
+
+            let send = std::cmp::min(allowed as usize, unsent);
+            if send < allowed && self.closed && self.closed_at.is_none() {
+                self.tcp.fin = true;
+                self.closed_at = Some(self.send.nxt.wrapping_add(unsent as u32));
+            }
+            let (mut h, mut t) = self.unacked.as_slices();
+            if h.len() >= nunacked {
+                h = &h[nunacked..];
+            } else {
+                let skipped = h.len();
+                h = &[];
+                t = &t[(nunacked - skipped)..];
+            }
+            self.write(dev, self.send.nxt, 0, 0)?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.closed = true;
     }
 }
 
